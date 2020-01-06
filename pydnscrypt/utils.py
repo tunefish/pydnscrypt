@@ -108,14 +108,13 @@ def validate_provider_name(name, supported_majors):
         return False
 
 
-def prepare_hex_pk(pk):
-    """
-    Prepares a provider public key for decoding by removing all colons
-    (used for grouping key into 2 byte groups)
-    """
-    if isinstance(pk, bytes):
-        return pk.replace(b':', b'').lower()
-    return pk.replace(':', '').lower()
+def ensure_bytes(data):
+    if isinstance(data, str):
+        data = data.encode()
+
+    if not isinstance(data, bytes):
+        raise TypeError('Input must be bytes')
+    return data
 
 
 def ceil_to_power_of_2(number, round_to):

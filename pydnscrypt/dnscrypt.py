@@ -12,13 +12,13 @@ import dns.exception
 
 import dnsstamps
 
-from const import *
-import utils
-
 try:
     import sodium_wrapper as crypto
 except (OSError, AttributeError):
     raise RuntimeError('Please install libsodium on your system')
+
+from const import *
+import utils
 
 
 class DNSCryptCertificate:
@@ -149,11 +149,11 @@ class DNSCryptClient:
                  ip,
                  provider_name,
                  provider_pk,
-                 provider_pk_encoder=crypto.HexEncoder,
+                 provider_pk_encoder=crypto.GroupedHexEncoder,
                  port=DNSCRYPT_PORT_DEFAULT,
                  timeout=5,
                  private_key=None,
-                 private_key_encoding=crypto.RawEncoder,
+                 private_key_encoder=crypto.RawEncoder,
                  ephemeral_keys=False,
                  obtain_certificate=True,
                  tcp=False):
@@ -172,12 +172,13 @@ class DNSCryptClient:
             )
 
         if private_key:
-            self._private_key = crypto.Curve25519SecretKey(private_key, encoder=private_key_encoding)
+            private_key = utils.ensure_bytes(private_key)
+            self._private_key = crypto.Curve25519SecretKey(private_key, encoder=private_key_encoder)
         else:
             self._private_key = crypto.Curve25519SecretKey.generate()
 
         try:
-            provider_pk = utils.prepare_hex_pk(provider_pk)
+            provider_pk = utils.ensure_bytes(provider_pk)
             self.provider_pk = crypto.Ed25519VerifyKey(provider_pk, encoder=provider_pk_encoder)
         except crypto.CryptoError:
             raise ValueError(f'Invalid public key {provider_pk}')

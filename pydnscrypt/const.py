@@ -1,5 +1,5 @@
-import nacl.bindings
-import nacl.public
+import sodium_wrapper
+
 
 DNSCRYPT_PORT_DEFAULT = 443
 DNSCRYPT_RELAY_PORT_DEFAULT = 443
@@ -16,7 +16,7 @@ QUERY_MODULO_SIZE = 64
 
 DNSCRYPT_QUERY_OVERHEAD = (
     len(RESOLVER_MAGIC)
-    + nacl.bindings.crypto_box_PUBLICKEYBYTES
-    + nacl.public.Box.NONCE_SIZE//2
-    + nacl.bindings.crypto_secretbox_MACBYTES
+    + sodium_wrapper.Curve25519PublicKey.SIZE
+    + sodium_wrapper.XChaCha20Box.NONCE_SIZE//2
+    + sodium_wrapper.XChaCha20Box.MAC_SIZE
 )

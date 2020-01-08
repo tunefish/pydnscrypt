@@ -1,0 +1,2 @@
+class CryptoError(Exception):
+    pass

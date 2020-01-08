@@ -2,8 +2,7 @@ import binascii
 
 from os import urandom as random
 
-import sodium_bindings as sodium_lib
-from sodium_bindings import CryptoError
+import pydnscrypt.sodium_bindings as sodium_lib
 
 
 class Encoder:
@@ -33,14 +32,15 @@ class HexEncoder(Encoder):
 
     @staticmethod
     def decode(data):
-        return binascii.unhexlify(data)    
+        return binascii.unhexlify(data)
 
 
 class GroupedHexEncoder(Encoder):
     @staticmethod
     def encode(data, separator=b':', group_size=2):
         hex_data = HexEncoder.encode(data)
-        return separator.join(hex_data[i:i+group_size] for i in range(0, len(hex_data), group_size))
+        return separator.join(hex_data[i:i+group_size]
+                              for i in range(0, len(hex_data), group_size))
 
     @staticmethod
     def decode(data, separator=b':'):
@@ -58,7 +58,9 @@ class Key:
             raise TypeError(f'{type(self).__name__} must be created from bytes')
 
         if len(self._key) != self.SIZE:
-            raise ValueError(f'{type(self).__name__} must be exactly {self.SIZE} bytes long')
+            raise ValueError(
+                f'{type(self).__name__} must be exactly {self.SIZE} bytes long'
+            )
 
     def encode(self, encoder=RawEncoder):
         return encoder.encode(bytes(self))
@@ -98,7 +100,7 @@ class Curve25519PublicKey(Key):
 
     __slots__ = ()
 
-    
+
 class Curve25519SecretKey(Key):
     SIZE = sodium_lib.CURVE25519_SECRETKEYBYTES
 
@@ -114,38 +116,38 @@ class Curve25519SecretKey(Key):
 class Curve25519Box:
     NONCE_SIZE = 0
     MAC_SIZE = 0
+    SHAREDKEY_SIZE = 0
 
     __slots__ = ('_shared_key',)
 
-    def __init__(self, private_key, public_key):
+    def __init__(self, private_key, public_key, shared_key=None):
         if private_key and public_key:
             if (not isinstance(private_key, Curve25519SecretKey)
-                or not isinstance(public_key, Curve25519PublicKey)):
+                    or not isinstance(public_key, Curve25519PublicKey)):
                 raise TypeError('Box must be created from Curve25519 keys')
 
             # precompute shared key
-            self._shared_key = self._crypto_box_beforenm(
-                bytes(public_key),
-                bytes(private_key)
-            )
+            self._shared_key = self._crypto_box_beforenm(bytes(public_key),
+                                                         bytes(private_key))
         else:
-            self._shared_key = None
+            self._shared_key = shared_key
 
     def __bytes__(self):
         return self._shared_key
 
     @classmethod
     def decode(cls, encoded, encoder=RawEncoder):
-        box = cls(None, None)
-        box._shared_key = encoder.decode(encoded)
+        shared_key = encoder.decode(encoded)
 
-        if not isinstance(box._shared_key, bytes):
-            raise ValueError(f'{cls.__name__} must be decoded from bytes')
+        if not isinstance(shared_key, bytes):
+            raise TypeError(f'{cls.__name__} must be decoded from bytes')
 
-        if len(box._shared_key) != cls.BEFORENMBYTES:
-            raise ValueError(f'{cls.__name__} must exactly {cls.BEFORENMBYTES} bytes long')
+        if len(shared_key) != cls.SHAREDKEY_SIZE:
+            raise ValueError(
+                f'{cls.__name__} must exactly {cls.SHAREDKEY_SIZE} bytes long'
+            )
 
-        return box
+        return cls(None, None, shared_key=shared_key)
 
     def encrypt(self, plaintext, nonce=None, encoder=RawEncoder):
         if nonce is None:
@@ -192,6 +194,7 @@ class Curve25519Box:
 class XChaCha20Box(Curve25519Box):
     NONCE_SIZE = sodium_lib.XCHACHA20_NONCEBYTES
     MAC_SIZE = sodium_lib.XCHACHA20_MACBYTES
+    SHAREDKEY_SIZE = sodium_lib.XCHACHA20_BEFORENMBYTES
 
     __slots__ = ()
 
@@ -201,16 +204,25 @@ class XChaCha20Box(Curve25519Box):
 
     @staticmethod
     def _crypto_box_afternm(plaintext, nonce, k):
-        return sodium_lib.crypto_box_curve25519xchacha20poly1305_afternm(plaintext, nonce, k)
+        return sodium_lib.crypto_box_curve25519xchacha20poly1305_afternm(
+            plaintext,
+            nonce,
+            k
+        )
 
     @staticmethod
     def _crypto_box_open_afternm(ciphertext, nonce, k):
-        return sodium_lib.crypto_box_curve25519xchacha20poly1305_open_afternm(ciphertext, nonce, k)
+        return sodium_lib.crypto_box_curve25519xchacha20poly1305_open_afternm(
+            ciphertext,
+            nonce,
+            k
+        )
 
 
 class XSalsa20Box(Curve25519Box):
     NONCE_SIZE = sodium_lib.XSALSA20_NONCEBYTES
     MAC_SIZE = sodium_lib.XSALSA20_MACBYTES
+    SHAREDKEY_SIZE = sodium_lib.XSALSA20_BEFORENMBYTES
 
     __slots__ = ()
 
@@ -220,8 +232,16 @@ class XSalsa20Box(Curve25519Box):
 
     @staticmethod
     def _crypto_box_afternm(plaintext, nonce, k):
-        return sodium_lib.crypto_box_curve25519xsalsa20poly1305_afternm(plaintext, nonce, k)
+        return sodium_lib.crypto_box_curve25519xsalsa20poly1305_afternm(
+            plaintext,
+            nonce,
+            k
+        )
 
     @staticmethod
     def _crypto_box_open_afternm(ciphertext, nonce, k):
-        return sodium_lib.crypto_box_curve25519xsalsa20poly1305_open_afternm(ciphertext, nonce, k)
+        return sodium_lib.crypto_box_curve25519xsalsa20poly1305_open_afternm(
+            ciphertext,
+            nonce,
+            k
+        )

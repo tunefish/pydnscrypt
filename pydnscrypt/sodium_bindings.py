@@ -1,10 +1,13 @@
 import ctypes
 import ctypes.util
 
+from pydnscrypt.exception import CryptoError
+
 
 _sodium = ctypes.cdll.LoadLibrary(ctypes.util.find_library('sodium') or
                                   ctypes.util.find_library('libsodium'))
 
+# make sure all required symbols exist at startup
 box_xchacha20p1305_beforenm = _sodium.crypto_box_curve25519xchacha20poly1305_beforenm
 box_xchacha20p1305_afternm = _sodium.crypto_box_curve25519xchacha20poly1305_easy_afternm
 box_xchacha20p1305_open_afternm = _sodium.crypto_box_curve25519xchacha20poly1305_open_easy_afternm
@@ -18,6 +21,7 @@ scalarmult_curve25519_base = _sodium.crypto_scalarmult_curve25519_base
 ed25519_sign_open = _sodium.crypto_sign_ed25519_open
 
 memcmp = _sodium.sodium_memcmp
+
 
 XCHACHA20_BEFORENMBYTES = _sodium.crypto_box_curve25519xchacha20poly1305_beforenmbytes()
 XCHACHA20_NONCEBYTES = _sodium.crypto_secretbox_xchacha20poly1305_noncebytes()
@@ -36,10 +40,6 @@ CURVE25519_BYTES = _sodium.crypto_scalarmult_curve25519_bytes()
 ED25519_PUBLICKEYBYTES = _sodium.crypto_sign_ed25519_publickeybytes()
 
 
-class CryptoError(Exception):
-    pass
-
-
 def crypto_box_curve25519xchacha20poly1305_beforenm(pk, sk):
     if len(pk) != CURVE25519_PUBLICKEYBYTES:
         raise ValueError('Invalid public key')
@@ -49,6 +49,7 @@ def crypto_box_curve25519xchacha20poly1305_beforenm(pk, sk):
     shared_key = ctypes.create_string_buffer(XCHACHA20_BEFORENMBYTES)
 
     res = box_xchacha20p1305_beforenm(shared_key, pk, sk)
+
     if res != 0:
         raise RuntimeError('Unexpected library error')
     return shared_key.raw
@@ -66,6 +67,7 @@ def crypto_box_curve25519xchacha20poly1305_afternm(message, nonce, k):
     cipher = ctypes.create_string_buffer(len(message) + XCHACHA20_MACBYTES)
 
     res = box_xchacha20p1305_afternm(cipher, message, message_len, nonce, k)
+
     if res != 0:
         raise RuntimeError('Unexpected library error')
 
@@ -85,6 +87,7 @@ def crypto_box_curve25519xchacha20poly1305_open_afternm(cipher, nonce, k):
     message = ctypes.create_string_buffer(len(cipher) - XCHACHA20_MACBYTES)
 
     res = box_xchacha20p1305_open_afternm(message, cipher, cipher_len, nonce, k)
+
     if res != 0:
         raise CryptoError('An error occuurred trying to decrypt the message')
 
@@ -101,6 +104,7 @@ def crypto_box_curve25519xsalsa20poly1305_beforenm(pk, sk):
     shared_key = ctypes.create_string_buffer(XSALSA20_BEFORENMBYTES)
 
     res = box_xsalsa20p1305_beforenm(shared_key, pk, sk)
+
     if res != 0:
         raise RuntimeError('Unexpected library error')
     return shared_key.raw
@@ -124,7 +128,12 @@ def crypto_box_curve25519xsalsa20poly1305_afternm(message, nonce, k):
     message_len = ctypes.c_ulonglong(len(padded_message))
     cipher = ctypes.create_string_buffer(len(message) + XSALSA20_ZEROBYTES)
 
-    res = box_xsalsa20p1305_afternm(cipher, padded_message, message_len, nonce, k)
+    res = box_xsalsa20p1305_afternm(cipher,
+                                    padded_message,
+                                    message_len,
+                                    nonce,
+                                    k)
+
     if res != 0:
         raise RuntimeError('Unexpected library error')
 
@@ -150,7 +159,12 @@ def crypto_box_curve25519xsalsa20poly1305_open_afternm(cipher, nonce, k):
     cipher_len = ctypes.c_ulonglong(len(padded_cipher))
     message = ctypes.create_string_buffer(len(padded_cipher))
 
-    res = box_xsalsa20p1305_open_afternm(message, padded_cipher, cipher_len, nonce, k)
+    res = box_xsalsa20p1305_open_afternm(message,
+                                         padded_cipher,
+                                         cipher_len,
+                                         nonce,
+                                         k)
+
     if res != 0:
         raise CryptoError('An error occuurred trying to decrypt the message')
 
@@ -162,6 +176,7 @@ def crypto_scalarmult_curve25519(n):
     q = ctypes.create_string_buffer(CURVE25519_BYTES)
 
     res = scalarmult_curve25519_base(q, n)
+
     if res != 0:
         raise RuntimeError('Unexpected library error')
     return q.raw
@@ -175,7 +190,12 @@ def crypto_ed25519_sign_open(signed_message, pk):
     message_len = ctypes.c_ulonglong()
     signed_len = ctypes.c_ulonglong(len(signed_message))
 
-    res = ed25519_sign_open(message, ctypes.byref(message_len), signed_message, signed_len, pk)
+    res = ed25519_sign_open(message,
+                            ctypes.byref(message_len),
+                            signed_message,
+                            signed_len,
+                            pk)
+
     if res != 0:
         raise CryptoError('Bad signature')
     return message.raw[:message_len.value]

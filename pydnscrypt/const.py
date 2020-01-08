@@ -1,4 +1,4 @@
-import sodium_wrapper
+import pydnscrypt.sodium_wrapper as sodium_wrapper
 
 
 DNSCRYPT_PORT_DEFAULT = 443

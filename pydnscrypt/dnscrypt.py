@@ -1,7 +1,7 @@
 import struct
 import time
 import threading
-import traceback
+import warnings
 
 from functools import partial
 
@@ -13,12 +13,12 @@ import dns.exception
 import dnsstamps
 
 try:
-    import sodium_wrapper as crypto
+    import pydnscrypt.sodium_wrapper as crypto
 except (OSError, AttributeError):
     raise RuntimeError('Please install libsodium on your system')
 
-from const import *
-import utils
+import pydnscrypt.const as const
+import pydnscrypt.utils as utils
 
 
 class DNSCryptCertificate:
@@ -53,7 +53,7 @@ class DNSCryptCertificate:
         self.valid_until = valid_until
 
     @classmethod
-    def from_bin(cls, cert, verify_key):
+    def decode(cls, cert, verify_key):
         """
         Parses a DNSCrypt certificate and returns a new instance
 
@@ -67,19 +67,23 @@ class DNSCryptCertificate:
             dns.exception.DNSException: If the certificate cannot be parsed or
                 the payload's signature cannot be verified
         """
-        if len(cert) < MIN_CERT_LEN:
+        if len(cert) < const.MIN_CERT_LEN:
             raise dns.exception.DNSException(
-                f'Message too short: {len(cert)}b given, {MIN_CERT_LEN}b needed'
+                f'Message too short: {len(cert)} bytes given, '
+                f'{const.MIN_CERT_LEN} bytes needed'
             )
 
         cert_magic, es_version, minor = struct.unpack_from('!4sHH', cert)
         signed_payload = cert[8:]
-        if cert_magic != CERT_MAGIC:
-            raise dns.exception.DNSException(f'Invalid certificate magic: {cert[:4]}')
+        if cert_magic != const.CERT_MAGIC:
+            raise dns.exception.DNSException(
+                f'Invalid certificate magic: {cert[:4]}'
+            )
 
         payload = verify_key.verify(signed_payload)
 
-        public_key, client_magic, serial, ts_start, ts_end = struct.unpack_from('!32s8sIII', payload)
+        unpacked = struct.unpack_from('!32s8sIII', payload)
+        public_key, client_magic, serial, ts_start, ts_end = unpacked
 
         return cls(
             minor=minor,
@@ -133,30 +137,59 @@ class DNSCryptClient:
     __slots__ = (
         'ip',
         'port',
-        'timeout',
         'provider_name',
         'provider_pk',
-        '_proto_version',
+        'timeout',
+        'ephemeral_keys',
+        '_cert_lock',
         '_cert',
         '_box',
-        '_min_query_len_estimator',
         '_private_key',
-        '_cert_lock',
-        'ephemeral_keys',
+        '_min_query_len_estimator',
     )
 
     def __init__(self,
                  ip,
                  provider_name,
                  provider_pk,
-                 provider_pk_encoder=crypto.GroupedHexEncoder,
-                 port=DNSCRYPT_PORT_DEFAULT,
+                 provider_pk_encoder=crypto.RawEncoder,
+                 port=const.DNSCRYPT_PORT_DEFAULT,
                  timeout=5,
                  private_key=None,
                  private_key_encoder=crypto.RawEncoder,
                  ephemeral_keys=False,
                  obtain_certificate=True,
+                 raise_invalid_provider_name=False,
                  tcp=False):
+        if not utils.validate_provider_name(provider_name, ('2',)):
+            msg = (
+                f'Provider name {provider_name} does not conform to DNSCrypt'
+                'specification: <protocol-major-version>.dnscrypt-cert.<zone>'
+            )
+
+            if raise_invalid_provider_name:
+                raise ValueError(msg)
+            warnings.warn(msg, category=UserWarning)
+
+        if private_key:
+            try:
+                self._private_key = crypto.Curve25519SecretKey(
+                    private_key,
+                    encoder=private_key_encoder
+                )
+            except (TypeError, ValueError) as ex:
+                raise ValueError(f'Invalid private key {private_key}: {ex}')
+        else:
+            self._private_key = crypto.Curve25519SecretKey.generate()
+
+        try:
+            self.provider_pk = crypto.Ed25519VerifyKey(
+                provider_pk,
+                encoder=provider_pk_encoder
+            )
+        except (TypeError, ValueError) as ex:
+            raise ValueError(f'Invalid public key {provider_pk}: {ex}')
+
         self.ip = ip
         self.port = port
         self.provider_name = provider_name
@@ -165,42 +198,17 @@ class DNSCryptClient:
         self.timeout = timeout
         self.ephemeral_keys = ephemeral_keys
 
-        if not utils.validate_provider_name(provider_name, ('2',)):
-            raise ValueError(
-                f'Invalid provider name {provider_name}.'
-                'Must be <protocol-major-version>.dnscrypt-cert.<zone>'
-            )
-
-        if private_key:
-            private_key = utils.ensure_bytes(private_key)
-            self._private_key = crypto.Curve25519SecretKey(private_key, encoder=private_key_encoder)
-        else:
-            self._private_key = crypto.Curve25519SecretKey.generate()
-
-        try:
-            provider_pk = utils.ensure_bytes(provider_pk)
-            self.provider_pk = crypto.Ed25519VerifyKey(provider_pk, encoder=provider_pk_encoder)
-        except crypto.CryptoError:
-            raise ValueError(f'Invalid public key {provider_pk}')
-
-        self._min_query_len_estimator = utils.MinQuestionSizeEstimator()
+        self._cert_lock = threading.Lock()
         self._cert = None
         self._box = None
-        self._cert_lock = threading.Lock()
+        self._min_query_len_estimator = utils.MinQuestionSizeEstimator()
 
         if obtain_certificate:
             self.refresh_certificate(tcp=tcp)
 
     @classmethod
     def from_stamp(cls, stamp, *args, **kwargs):
-        if isinstance(stamp, bytes):
-            stamp = stamp.decode()
-        if isinstance(stamp, str):
-            stamp = dnsstamps.parse(stamp)
-        if not isinstance(stamp, dnsstamps.parameter.Parameter):
-            raise ValueError(
-                'Invalid stamp type, must be one of: str, bytes, dnsstamps.parameter.Parameter'
-            )
+        stamp = utils.prepare_stamp(stamp)
 
         if stamp.protocol != dnsstamps.Protocol.DNSCRYPT:
             raise ValueError('Not a DNSCRYPT server')
@@ -208,11 +216,12 @@ class DNSCryptClient:
         args = {
             'provider_name': stamp.provider_name,
             'provider_pk': stamp.public_key,
+            'provider_pk_encoder': crypto.HexEncoder
         }
 
         args['ip'], args['port'] = utils.parse_dnsstamp_address(
             stamp.address,
-            default_port=DNSCRYPT_PORT_DEFAULT
+            default_port=const.DNSCRYPT_PORT_DEFAULT
         )
 
         args.update(kwargs)
@@ -226,16 +235,15 @@ class DNSCryptClient:
     def _get_new_certificate(self, tcp=False):
         """Must hold self._cert_lock when calling _get_new_certificate"""
 
-        query_certs = dns.message.make_query(self.provider_name, rdtype=dns.rdatatype.TXT)
+        query_certs = dns.message.make_query(self.provider_name,
+                                             rdtype=dns.rdatatype.TXT)
 
         answer = None
         if not tcp:
             try:
-                answer = self._query_certificate_udp(
-                    query_certs,
-                    timeout=self.timeout,
-                    ignore_unexpected=True
-                )
+                answer = self._query_certificate_udp(query_certs,
+                                                     timeout=self.timeout,
+                                                     ignore_unexpected=True)
                 if answer.flags & dns.flags.TC:
                     tcp = True
             except dns.exception.Timeout:
@@ -243,37 +251,41 @@ class DNSCryptClient:
 
         if tcp:
             try:
-                answer = self._query_certificate_udp(
-                    query_certs,
-                    timeout=self.timeout
-                )
+                answer = self._query_certificate_udp(query_certs,
+                                                     timeout=self.timeout)
             except dns.exception.Timeout:
                 pass
 
+        if not answer or len(answer.answer) == 0:
+            raise dns.exception.DNSException(
+                f'No reply from {self.provider_name} ({self.ip}:{self.port})'
+            )
+
         selected_cert = None
-        if answer and len(answer.answer) > 0:
-            for cert in answer.answer[0]:
-                cert_bin = b''.join(cert.strings)
-                try:
-                    cert = DNSCryptCertificate.from_bin(cert_bin, self.provider_pk)
-                except dns.exception.DNSException:
-                    continue
+        for cert in answer.answer[0]:
+            cert_encoded = b''.join(cert.strings)
+            try:
+                cert = DNSCryptCertificate.decode(cert_encoded, self.provider_pk)
+            except dns.exception.DNSException:
+                continue
 
-                encryption_system = cert.get_encryption_system()
-                if encryption_system is None or not cert.is_valid():
-                    continue
+            encryption_system = cert.get_encryption_system()
+            if encryption_system is None or not cert.is_valid():
+                continue
 
-                if selected_cert is None or selected_cert.serial < cert.serial:
-                    selected_cert = cert
+            if selected_cert is None or selected_cert.serial < cert.serial:
+                selected_cert = cert
 
         if not selected_cert:
             raise dns.exception.DNSException(
-                f'No valid certificate received from {self.provider_name} ({self.ip}:{self.port})'
+                'No valid certificate received from '
+                f'{self.provider_name} ({self.ip}:{self.port})'
             )
 
         self._cert = selected_cert
-        es = selected_cert.get_encryption_system()
-        self._box = es(self._private_key, selected_cert.get_public_key())
+        encryption_system = selected_cert.get_encryption_system()
+        self._box = encryption_system(self._private_key,
+                                      selected_cert.get_public_key())
 
     def query(self,
               qname,
@@ -296,7 +308,8 @@ class DNSCryptClient:
 
         # Not supported by dnspython, also some nameservers dropped support for
         # ANY requests, most notably Cloudflare
-        if dns.rdatatype.is_metatype(rdtype) or dns.rdataclass.is_metaclass(rdclass):
+        if (dns.rdatatype.is_metatype(rdtype)
+                or dns.rdataclass.is_metaclass(rdclass)):
             raise dns.resolver.NoMetaqueries()
 
         self.refresh_certificate(tcp=tcp)
@@ -305,35 +318,32 @@ class DNSCryptClient:
 
         response = None
         exceptions = []
+        timeout = lifetime or self.timeout
         if not tcp:
             try:
-                response = self._query_encrypted_udp(
-                    query,
-                    source=source,
-                    source_port=source_port,
-                    timeout=lifetime or self.timeout,
-                    ignore_unexpected=True
-                )
+                response = self._query_encrypted_udp(query,
+                                                     source=source,
+                                                     source_port=source_port,
+                                                     timeout=timeout,
+                                                     ignore_unexpected=True)
                 if response.flags & dns.flags.TC:
                     self._min_query_len_estimator.update_tc_flag()
                     tcp = True
                 else:
-                    total_query_len = len(query.to_wire()) + DNSCRYPT_QUERY_OVERHEAD
+                    total_query_len = (len(query.to_wire())
+                                       + const.DNSCRYPT_QUERY_OVERHEAD)
                     self._min_query_len_estimator.update(total_query_len)
             except Exception as ex:
-                print(traceback.format_exc())
                 exceptions.append((self.ip, False, self.port, ex, response))
+                tcp = True
 
         if tcp:
             try:
-                response = self._query_encrypted_tcp(
-                    query,
-                    source=source,
-                    source_port=source_port,
-                    timeout=lifetime or self.timeout
-                )
+                response = self._query_encrypted_tcp(query,
+                                                     source=source,
+                                                     source_port=source_port,
+                                                     timeout=timeout)
             except Exception as ex:
-                print(traceback.format_exc())
                 exceptions.append((self.ip, False, self.port, ex, response))
 
         if not response:
@@ -345,37 +355,31 @@ class DNSCryptClient:
         if rcode == dns.rcode.NXDOMAIN:
             raise dns.resolver.NXDOMAIN(qnames=[qname], responses=[response])
 
-        return dns.resolver.Answer(
-            qname,
-            rdtype,
-            rdclass,
-            response,
-            raise_on_no_answer=raise_on_no_answer
-        )
+        return dns.resolver.Answer(qname,
+                                   rdtype,
+                                   rdclass,
+                                   response,
+                                   raise_on_no_answer=raise_on_no_answer)
 
     def _compute_padded_len_udp(self, message):
         # Account for the b'\x80' padding byte that is always added
-        min_query_size = DNSCRYPT_QUERY_OVERHEAD + len(message) + 1
+        min_query_size = const.DNSCRYPT_QUERY_OVERHEAD + len(message) + 1
 
-        min_query_size = max(min_query_size, self._min_query_len_estimator.get_min_size())
-        return utils.ceil_to_power_of_2(min_query_size, QUERY_MODULO_SIZE)
+        min_query_size = max(min_query_size,
+                             self._min_query_len_estimator.get_min_size())
+        return utils.ceil_to_power_of_2(min_query_size, const.QUERY_MODULO_SIZE)
 
     def _compute_padded_len_tcp(self, message):
-        # Append between (1, 256) bytes of paCERT_MAGICCERT_MAGICdding such that the total
-        # message length is a multiple of QUERY_MODULO_SIZE
+        # Append between (1, 256) bytes of padding such that the total
+        # message length is a multiple of const.QUERY_MODULO_SIZE
         min_query_size = len(message) + (crypto.random(1)[0] or 1)
-        return utils.ceil_to_power_of_2(min_query_size, QUERY_MODULO_SIZE)
+        return utils.ceil_to_power_of_2(min_query_size, const.QUERY_MODULO_SIZE)
 
-    def _encrypt_query(self, query, proto):
+    def _encrypt_query(self, query, compute_padded_len):
         message = query.to_wire()
-        if proto == utils.TransportProto.UDP:
-            padding_len = self._compute_padded_len_udp(message)
-        elif proto == utils.TransportProto.TCP:
-            padding_len = self._compute_padded_len_tcp(message)
-        else:
-            raise ValueError(f'Invalid protocol {proto}')
 
-        padding_len = min(padding_len, MAX_UDP_DNSPACKET_SIZE)
+        padding_len = compute_padded_len(message)
+        padding_len = min(padding_len, const.MAX_UDP_DNSPACKET_SIZE)
         if padding_len <= len(message):
             raise dns.exception.DNSException('Query too long')
 
@@ -398,7 +402,7 @@ class DNSCryptClient:
         magic = response[:8]
         cipher = response[8:]
 
-        if magic != RESOLVER_MAGIC:
+        if magic != const.RESOLVER_MAGIC:
             raise TypeError(f'Invalid RESOLVER MAGIC {magic}')
 
         if cipher[:box.NONCE_SIZE//2] != expected_nonce[:box.NONCE_SIZE//2]:
@@ -408,48 +412,40 @@ class DNSCryptClient:
         return dns.message.from_wire(message, **kwargs)
 
     def _query_certificate_udp(self, query, **kwargs):
-        return utils.query_udp(
-            self.ip,
-            self.port,
-            query,
-            utils.PlainQueryEncoder,
-            **kwargs
-        )
+        return utils.query_udp(self.ip,
+                               self.port,
+                               query,
+                               utils.PlainQueryEncoder,
+                               **kwargs)
 
     def _query_certificate_tcp(self, query, **kwargs):
-        return utils.query_tcp(
-            self.ip,
-            self.port,
-            query,
-            utils.PlainQueryEncoder,
-            **kwargs
-        )
+        return utils.query_tcp(self.ip,
+                               self.port,
+                               query,
+                               utils.PlainQueryEncoder,
+                               **kwargs)
 
     def _query_encrypted_udp(self, query, **kwargs):
         encoder = utils.QueryEncoder(
-            partial(self._encrypt_query, proto=utils.TransportProto.UDP),
+            partial(self._encrypt_query, self._compute_padded_len_udp),
             self._decrypt_response
         )
-        return utils.query_udp(
-            self.ip,
-            self.port,
-            query,
-            encoder,
-            **kwargs
-        )
+        return utils.query_udp(self.ip,
+                               self.port,
+                               query,
+                               encoder,
+                               **kwargs)
 
     def _query_encrypted_tcp(self, query, **kwargs):
         encoder = utils.QueryEncoder(
-            partial(self._encrypt_query, proto=utils.TransportProto.TCP),
+            partial(self._encrypt_query, self._compute_padded_len_tcp),
             self._decrypt_response
         )
-        return utils.query_tcp(
-            self.ip,
-            self.port,
-            query,
-            encoder,
-            **kwargs
-        )
+        return utils.query_tcp(self.ip,
+                               self.port,
+                               query,
+                               encoder,
+                               **kwargs)
 
 
 class AnonymousDNSCryptClient(DNSCryptClient):
@@ -458,17 +454,15 @@ class AnonymousDNSCryptClient(DNSCryptClient):
     def __init__(self,
                  *args,
                  relay_ip=None,
-                 relay_port=DNSCRYPT_PORT_DEFAULT,
+                 relay_port=const.DNSCRYPT_RELAY_PORT_DEFAULT,
                  ephemeral_keys=True,
                  obtain_certificate=False,
                  **kwargs):
         # obtain certifiate later when relay IP and port are initialized
-        super().__init__(
-            *args,
-            ephemeral_keys=ephemeral_keys,
-            obtain_certificate=False,
-            **kwargs
-        )
+        super().__init__(*args,
+                         ephemeral_keys=ephemeral_keys,
+                         obtain_certificate=False,
+                         **kwargs)
 
         self.relay_ip = relay_ip
         self.relay_port = relay_port
@@ -485,7 +479,7 @@ class AnonymousDNSCryptClient(DNSCryptClient):
 
         kwargs['relay_ip'], kwargs['relay_port'] = utils.parse_dnsstamp_address(
             relay_stamp.address,
-            default_port=DNSCRYPT_RELAY_PORT_DEFAULT
+            default_port=const.DNSCRYPT_RELAY_PORT_DEFAULT
         )
 
         if 'relay_port' in kwargs:
@@ -494,43 +488,56 @@ class AnonymousDNSCryptClient(DNSCryptClient):
         return super(AnonymousDNSCryptClient, cls).from_stamp(stamp, **kwargs)
 
     def _relay_packet(self, packet):
-        return ANON_MAGIC + utils.serialize_ip(self.ip) + utils.serialize_port(self.port) + packet
+        return (const.ANON_MAGIC
+                + utils.serialize_ip(self.ip)
+                + utils.serialize_port(self.port)
+                + packet)
 
     def _query_certificate_udp(self, query, **kwargs):
         encoder = utils.QueryEncoder(
             lambda q: (self._relay_packet(q.to_wire()), None),
             utils.PlainQueryEncoder.decode
         )
-        return utils.query_udp(self.relay_ip, self.relay_port, query, encoder, **kwargs)
+        return utils.query_udp(self.relay_ip,
+                               self.relay_port,
+                               query,
+                               encoder,
+                               **kwargs)
 
     def _query_certificate_tcp(self, query, **kwargs):
         encoder = utils.QueryEncoder(
             lambda q: (self._relay_packet(q.to_wire()), None),
             utils.PlainQueryEncoder.decode
         )
-        return utils.query_tcp(self.relay_ip, self.relay_port, query, encoder, **kwargs)
+        return utils.query_tcp(self.relay_ip,
+                               self.relay_port,
+                               query,
+                               encoder,
+                               **kwargs)
 
     def _query_encrypted_udp(self, query, **kwargs):
         def _encode(query):
-            wire, args = self._encrypt_query(query, utils.TransportProto.UDP)
+            wire, args = self._encrypt_query(query, self._compute_padded_len_udp)
             return self._relay_packet(wire), args
 
-        encoder = utils.QueryEncoder(
-            _encode,
-            self._decrypt_response
-        )
-        return utils.query_udp(self.relay_ip, self.relay_port, query, encoder, **kwargs)
+        encoder = utils.QueryEncoder(_encode, self._decrypt_response)
+        return utils.query_udp(self.relay_ip,
+                               self.relay_port,
+                               query,
+                               encoder,
+                               **kwargs)
 
     def _query_encrypted_tcp(self, query, **kwargs):
         def _encode(query):
-            wire, args = self._encrypt_query(query, utils.TransportProto.TCP)
+            wire, args = self._encrypt_query(query, self._compute_padded_len_tcp)
             return self._relay_packet(wire), args
 
-        encoder = utils.QueryEncoder(
-            _encode,
-            self._decrypt_response
-        )
-        return utils.query_tcp(self.relay_ip, self.relay_port, query, encoder, **kwargs)
+        encoder = utils.QueryEncoder(_encode, self._decrypt_response)
+        return utils.query_tcp(self.relay_ip,
+                               self.relay_port,
+                               query,
+                               encoder,
+                               **kwargs)
 
 
 class AnonymousDNSCryptClientFactory:
@@ -548,4 +555,6 @@ class AnonymousDNSCryptClientFactory:
         return cls(relay_stamp)
 
     def from_stamp(self, stamp, **kwargs):
-        return AnonymousDNSCryptClient.from_stamps(self.relay_stamp, stamp, **kwargs)
+        return AnonymousDNSCryptClient.from_stamps(self.relay_stamp,
+                                                   stamp,
+                                                   **kwargs)

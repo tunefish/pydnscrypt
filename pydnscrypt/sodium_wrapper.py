@@ -78,8 +78,15 @@ class Key:
             and sodium_lib.sodium_memcmp(bytes(self), bytes(other))
         )
 
+
+class GeneratableKey(Key):
+    """A key which can be generated (usually secret/private keys)"""
+
+    __slots__ = ()
+
     @classmethod
     def generate(cls):
+        """Generates a new, random key using a CSPRNG"""
         return cls(random(cls.SIZE))
 
 
@@ -96,12 +103,19 @@ class Ed25519VerifyKey(Key):
 
 
 class Curve25519PublicKey(Key):
+    """A wrapper for Curve25519 public keys"""
+
     SIZE = sodium_lib.CURVE25519_PUBLICKEYBYTES
 
     __slots__ = ()
 
 
-class Curve25519SecretKey(Key):
+class Curve25519PrivateKey(GeneratableKey):
+    """
+    A wrapper for Curve25199 private keys. The corresponding public key can be
+    accessed via the `public_key` attribute
+    """
+
     SIZE = sodium_lib.CURVE25519_SECRETKEYBYTES
 
     __slots__ = ('public_key',)
@@ -122,7 +136,7 @@ class Curve25519Box:
 
     def __init__(self, private_key, public_key, shared_key=None):
         if private_key and public_key:
-            if (not isinstance(private_key, Curve25519SecretKey)
+            if (not isinstance(private_key, Curve25519PrivateKey)
                     or not isinstance(public_key, Curve25519PublicKey)):
                 raise TypeError('Box must be created from Curve25519 keys')
 

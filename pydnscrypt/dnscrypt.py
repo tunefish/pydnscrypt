@@ -19,6 +19,7 @@ except (OSError, AttributeError):
 
 import pydnscrypt.const as const
 import pydnscrypt.utils as utils
+from pydnscrypt.query import query_udp, query_tcp, QueryEncoder, PlainQueryEncoder
 
 
 class DNSCryptCertificate:
@@ -60,8 +61,8 @@ class DNSCryptCertificate:
         Arguments:
             cert: the serialized certificate, as obtained through
                 the initial query to the DNSCrypt server
-            verify_key: an instance of nacl.signing.VerifyKey holding the public
-                key known from e.g. the DNSCrypt stamp
+            verify_key: an instance of sodium_wrapper.Ed25519VerifyKey holding
+                the public key known from e.g. the DNSCrypt stamp
 
         Raises:
             dns.exception.DNSException: If the certificate cannot be parsed or
@@ -173,14 +174,14 @@ class DNSCryptClient:
 
         if private_key:
             try:
-                self._private_key = crypto.Curve25519SecretKey(
+                self._private_key = crypto.Curve25519PrivateKey(
                     private_key,
                     encoder=private_key_encoder
                 )
             except (TypeError, ValueError) as ex:
                 raise ValueError(f'Invalid private key {private_key}: {ex}')
         else:
-            self._private_key = crypto.Curve25519SecretKey.generate()
+            self._private_key = crypto.Curve25519PrivateKey.generate()
 
         try:
             self.provider_pk = crypto.Ed25519VerifyKey(
@@ -193,7 +194,6 @@ class DNSCryptClient:
         self.ip = ip
         self.port = port
         self.provider_name = provider_name
-        self.provider_pk = None
 
         self.timeout = timeout
         self.ephemeral_keys = ephemeral_keys
@@ -321,11 +321,11 @@ class DNSCryptClient:
         timeout = lifetime or self.timeout
         if not tcp:
             try:
-                response = self._query_encrypted_udp(query,
-                                                     source=source,
-                                                     source_port=source_port,
-                                                     timeout=timeout,
-                                                     ignore_unexpected=True)
+                response = self.udp(query,
+                                    source=source,
+                                    source_port=source_port,
+                                    timeout=timeout,
+                                    ignore_unexpected=True)
                 if response.flags & dns.flags.TC:
                     self._min_query_len_estimator.update_tc_flag()
                     tcp = True
@@ -339,10 +339,10 @@ class DNSCryptClient:
 
         if tcp:
             try:
-                response = self._query_encrypted_tcp(query,
-                                                     source=source,
-                                                     source_port=source_port,
-                                                     timeout=timeout)
+                response = self.tcp(query,
+                                    source=source,
+                                    source_port=source_port,
+                                    timeout=timeout)
             except Exception as ex:
                 exceptions.append((self.ip, False, self.port, ex, response))
 
@@ -353,7 +353,7 @@ class DNSCryptClient:
         if rcode == dns.rcode.YXDOMAIN:
             raise dns.resolver.YXDOMAIN()
         if rcode == dns.rcode.NXDOMAIN:
-            raise dns.resolver.NXDOMAIN(qnames=[qname], responses=[response])
+            raise dns.resolver.NXDOMAIN(qname=[qname], responses=[response])
 
         return dns.resolver.Answer(qname,
                                    rdtype,
@@ -386,7 +386,7 @@ class DNSCryptClient:
         box = self._box
         public_key = self._private_key.public_key
         if self.ephemeral_keys:
-            ephemeral_key = crypto.Curve25519SecretKey.generate()
+            ephemeral_key = crypto.Curve25519PrivateKey.generate()
             box = type(box)(ephemeral_key, self._cert.get_public_key())
             public_key = ephemeral_key.public_key
         nonce = crypto.random(box.NONCE_SIZE//2).ljust(box.NONCE_SIZE, b'\x00')
@@ -412,40 +412,40 @@ class DNSCryptClient:
         return dns.message.from_wire(message, **kwargs)
 
     def _query_certificate_udp(self, query, **kwargs):
-        return utils.query_udp(self.ip,
-                               self.port,
-                               query,
-                               utils.PlainQueryEncoder,
-                               **kwargs)
+        return query_udp(self.ip,
+                         self.port,
+                         query,
+                         **kwargs)
 
     def _query_certificate_tcp(self, query, **kwargs):
-        return utils.query_tcp(self.ip,
-                               self.port,
-                               query,
-                               utils.PlainQueryEncoder,
-                               **kwargs)
+        return query_tcp(self.ip,
+                         self.port,
+                         query,
+                         **kwargs)
 
-    def _query_encrypted_udp(self, query, **kwargs):
-        encoder = utils.QueryEncoder(
-            partial(self._encrypt_query, self._compute_padded_len_udp),
+    def udp(self, query, **kwargs):
+        encoder = QueryEncoder(
+            partial(self._encrypt_query,
+                    compute_padded_len=self._compute_padded_len_udp),
             self._decrypt_response
         )
-        return utils.query_udp(self.ip,
-                               self.port,
-                               query,
-                               encoder,
-                               **kwargs)
+        return query_udp(self.ip,
+                         self.port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
-    def _query_encrypted_tcp(self, query, **kwargs):
-        encoder = utils.QueryEncoder(
-            partial(self._encrypt_query, self._compute_padded_len_tcp),
+    def tcp(self, query, **kwargs):
+        encoder = QueryEncoder(
+            partial(self._encrypt_query,
+                    compute_padded_len=self._compute_padded_len_tcp),
             self._decrypt_response
         )
-        return utils.query_tcp(self.ip,
-                               self.port,
-                               query,
-                               encoder,
-                               **kwargs)
+        return query_tcp(self.ip,
+                         self.port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
 
 class AnonymousDNSCryptClient(DNSCryptClient):
@@ -494,50 +494,50 @@ class AnonymousDNSCryptClient(DNSCryptClient):
                 + packet)
 
     def _query_certificate_udp(self, query, **kwargs):
-        encoder = utils.QueryEncoder(
+        encoder = QueryEncoder(
             lambda q: (self._relay_packet(q.to_wire()), None),
-            utils.PlainQueryEncoder.decode
+            PlainQueryEncoder.decode
         )
-        return utils.query_udp(self.relay_ip,
-                               self.relay_port,
-                               query,
-                               encoder,
-                               **kwargs)
+        return query_udp(self.relay_ip,
+                         self.relay_port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
     def _query_certificate_tcp(self, query, **kwargs):
-        encoder = utils.QueryEncoder(
+        encoder = QueryEncoder(
             lambda q: (self._relay_packet(q.to_wire()), None),
-            utils.PlainQueryEncoder.decode
+            PlainQueryEncoder.decode
         )
-        return utils.query_tcp(self.relay_ip,
-                               self.relay_port,
-                               query,
-                               encoder,
-                               **kwargs)
+        return query_tcp(self.relay_ip,
+                         self.relay_port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
-    def _query_encrypted_udp(self, query, **kwargs):
+    def udp(self, query, **kwargs):
         def _encode(query):
             wire, args = self._encrypt_query(query, self._compute_padded_len_udp)
             return self._relay_packet(wire), args
 
-        encoder = utils.QueryEncoder(_encode, self._decrypt_response)
-        return utils.query_udp(self.relay_ip,
-                               self.relay_port,
-                               query,
-                               encoder,
-                               **kwargs)
+        encoder = QueryEncoder(_encode, self._decrypt_response)
+        return query_udp(self.relay_ip,
+                         self.relay_port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
-    def _query_encrypted_tcp(self, query, **kwargs):
+    def tcp(self, query, **kwargs):
         def _encode(query):
             wire, args = self._encrypt_query(query, self._compute_padded_len_tcp)
             return self._relay_packet(wire), args
 
-        encoder = utils.QueryEncoder(_encode, self._decrypt_response)
-        return utils.query_tcp(self.relay_ip,
-                               self.relay_port,
-                               query,
-                               encoder,
-                               **kwargs)
+        encoder = QueryEncoder(_encode, self._decrypt_response)
+        return query_tcp(self.relay_ip,
+                         self.relay_port,
+                         query,
+                         query_encoder=encoder,
+                         **kwargs)
 
 
 class AnonymousDNSCryptClientFactory:
